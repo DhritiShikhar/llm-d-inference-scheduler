@@ -16,8 +16,8 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
-	"fmt"
 	"net/url"
 	"os"
 	"strconv"
@@ -138,14 +138,14 @@ func main() {
 
 	var configMap map[string]any
 	if *config != "" {
-		configMap = extractConfigFromCLI(*config)
+		configMap = extractConfigFromCLI(ctx, *config)
 		if *configFile != "" {
-			sidecarConfig.updateSidecarConfig(mergeYAMLConfigs(extractConfigFromFile(*configFile), configMap))
+			sidecarConfig.updateSidecarConfig(ctx, mergeYAMLConfigs(extractConfigFromFile(ctx, *configFile), configMap))
 		}
-		sidecarConfig.updateSidecarConfig(configMap)
+		sidecarConfig.updateSidecarConfig(ctx, configMap)
 	}
 	if *configFile != "" {
-		sidecarConfig.updateSidecarConfig(extractConfigFromFile(*configFile))
+		sidecarConfig.updateSidecarConfig(ctx, extractConfigFromFile(ctx, *configFile))
 	}
 
 	// Validate connector
@@ -225,11 +225,11 @@ func isDefault(parameter string) bool {
 
 // extractConfigFromCLI extracts config provided directly as flag parameter
 // "--config={port: 8085, vllm-port: 8203}"
-func extractConfigFromCLI(config string) map[string]any {
+func extractConfigFromCLI(ctx context.Context, config string) map[string]any {
+	logger := log.FromContext(ctx)
 	var temp map[string]any
 	if err := yaml.Unmarshal([]byte(config), &temp); err != nil {
-		// logger.Error(err, "Failed to unmarshal sidecar configuration")
-		fmt.Printf("Failed to unmarshal sidecar configuration\n")
+		logger.Error(err, "Failed to unmarshal sidecar configuration")
 	}
 	return temp
 
@@ -237,23 +237,24 @@ func extractConfigFromCLI(config string) map[string]any {
 
 // extractConfigFromCLI extracts config from file path
 // "--config-file=/etc/config/sidecar-config.yaml"
-func extractConfigFromFile(configFile string) map[string]any {
+func extractConfigFromFile(ctx context.Context, configFile string) map[string]any {
+	logger := log.FromContext(ctx)
 	var temp map[string]any
 	rawFile, err := os.ReadFile(configFile)
 	if err != nil {
-		// logger.Error(err, "Failed to read sidecar configuration file")
-		fmt.Printf("Failed to read sidecar configuration file\n")
+		logger.Error(err, "Failed to read sidecar configuration file")
 	}
 	if err := yaml.Unmarshal(rawFile, &temp); err != nil {
-		// logger.Error(err, "Failed to unmarshal sidecar configuration")
-		fmt.Printf("Failed to unmarshal sidecar configuration\n")
+		logger.Error(err, "Failed to unmarshal sidecar configuration")
 
 	}
 	return temp
 }
 
-// mergeYAMLConfigs merges YAML obtained from config file ("--config-file")  into YAML as CLI parameter ("--config"),
-// gives higher priority to YAML as CLI parameter
+// mergeYAMLConfigs merges:
+// 1. YAML from config file ("--config-file")
+// 2. YAML in CLI parameter ("--config"),
+// gives higher priority to YAML in CLI parameter
 func mergeYAMLConfigs(fileYAML, parameterYAML map[string]any) map[string]any {
 	for k, v := range parameterYAML {
 		if val, ok := fileYAML[k]; ok {
@@ -272,33 +273,31 @@ func mergeYAMLConfigs(fileYAML, parameterYAML map[string]any) map[string]any {
 // Update values from YAML only when:
 // 1. YAML config contains non-zero value
 // 2. sidecar config contains value not explicitely set by flag
-func (s *SidecarConfig) updateSidecarConfig(configMap configMap) {
+func (s *SidecarConfig) updateSidecarConfig(ctx context.Context, configMap configMap) {
+	logger := log.FromContext(ctx)
 	if configMap["port"] != nil {
 		if v, ok := configMap["port"].(int); ok {
 			if s.Port == defaultPort {
 				s.Port = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["vllm-port"] != nil {
 		if v, ok := configMap["vllm-port"].(int); ok {
 			if s.VLLMPort == defaultvLLMPort {
 				s.VLLMPort = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["connector"] != nil {
 		if v, ok := configMap["connector"].(string); ok {
 			if isDefault("connector") {
 				s.Connector = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["data-parallel-size"] != nil {
 		if v, ok := configMap["data-parallel-size"].(int); ok {
@@ -306,7 +305,7 @@ func (s *SidecarConfig) updateSidecarConfig(configMap configMap) {
 				s.VLLMDataParallelSize = v
 			}
 		} else {
-			fmt.Println("Type assertion failed")
+			logger.Error(nil, "Type assertion failed")
 		}
 	}
 	if configMap["prefiller-use-tls"] != nil {
@@ -314,98 +313,87 @@ func (s *SidecarConfig) updateSidecarConfig(configMap configMap) {
 			if isDefault("prefiller-use-tls") {
 				s.PrefillerUseTLS = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["decoder-use-tls"] != nil {
 		if v, ok := configMap["decoder-use-tls"].(bool); ok {
 			if isDefault("decoder-use-tls") {
 				s.DecoderUseTLS = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["prefiller-tls-insecure-skip-verify"] != nil {
 		if v, ok := configMap["prefiller-tls-insecure-skip-verify"].(bool); ok {
 			if isDefault("prefiller-tls-insecure-skip-verify") {
 				s.PrefillerInsecureSkipVerify = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["decoder-tls-insecure-skip-verify"] != nil {
 		if v, ok := configMap["decoder-tls-insecure-skip-verify"].(bool); ok {
 			if isDefault("decoder-tls-insecure-skip-verify") {
 				s.DecoderInsecureSkipVerify = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["secure-proxy"] != nil {
 		if v, ok := configMap["secure-proxy"].(bool); ok {
 			if isDefault("secure-proxy") {
 				s.SecureProxy = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["cert-path"] != nil {
 		if v, ok := configMap["cert-path"].(string); ok {
 			if isDefault("cert-path") {
 				s.CertPath = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["enable-ssrf-protection"] != nil {
 		if v, ok := configMap["enable-ssrf-protection"].(string); ok {
 			if isDefault("enable-ssrf-protection") {
 				s.CertPath = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["inference-pool-namespace"] != nil {
 		if v, ok := configMap["inference-pool-namespace"].(string); ok {
 			if isDefault("inference-pool-namespace") {
 				s.InferencePoolNamespace = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["inference-pool-name"] != nil {
 		if v, ok := configMap["inference-pool-name"].(string); ok {
 			if isDefault("inference-pool-name") {
 				s.InferencePoolName = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["enable-prefiller-sampling"] != nil {
 		if v, ok := configMap["enable-prefiller-sampling"].(bool); ok {
 			if isDefault("enable-prefiller-sampling") {
 				s.EnablePrefillerSampling = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["pool-group"] != nil {
 		if v, ok := configMap["pool-group"].(string); ok {
 			if isDefault("pool-group") {
 				s.PoolGroup = v
 			}
-		} else {
-			fmt.Println("Type assertion failed")
 		}
+		logger.Error(nil, "Type assertion failed")
 	}
 }
