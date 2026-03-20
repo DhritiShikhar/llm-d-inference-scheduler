@@ -30,7 +30,7 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/proxy"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/version"
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/telemetry"
-	"github.com/stretchr/testify/assert/yaml"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -135,18 +135,8 @@ func main() {
 		}()
 	}
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
-
-	var configMap map[string]any
-	if *config != "" {
-		configMap = extractConfigFromCLI(ctx, *config)
-		if *configFile != "" {
-			sidecarConfig.updateSidecarConfig(ctx, mergeYAMLConfigs(extractConfigFromFile(ctx, *configFile), configMap))
-		}
-		sidecarConfig.updateSidecarConfig(ctx, configMap)
-	}
-	if *configFile != "" {
-		sidecarConfig.updateSidecarConfig(ctx, extractConfigFromFile(ctx, *configFile))
-	}
+	sidecarConfig.processYAMLConfig(ctx, *config, *configFile)
+	logger.Info("Sidecar Configuration", sidecarConfig)
 
 	// Validate connector
 	isValidConnector := false
@@ -212,7 +202,28 @@ func main() {
 	}
 }
 
-// isDefault checks whether flag was provided by user or is a default input
+// processYAML extracts config provided in `--config` and `--config-file` parameters
+func (s *SidecarConfig) processYAMLConfig(ctx context.Context, config string, configFile string) {
+	var configMap1, configMap2 map[string]any
+	if config != "" {
+		configMap1 = extractConfigFromCLI(ctx, config)
+	}
+	if configFile != "" {
+		configMap2 = extractConfigFromFile(ctx, configFile)
+	}
+	switch {
+	case configMap1 != nil && configMap2 != nil:
+		s.updateSidecarConfig(ctx, mergeYAMLConfigs(configMap2, configMap1))
+	case configMap1 != nil && configMap2 == nil:
+		s.updateSidecarConfig(ctx, configMap1)
+	case configMap1 == nil && configMap2 != nil:
+		s.updateSidecarConfig(ctx, configMap2)
+	default:
+		break
+	}
+}
+
+// isDefault checks if flag is default or parsed value
 func isDefault(parameter string) bool {
 	result := true
 	flag.Visit(func(f *flag.Flag) {
@@ -256,56 +267,61 @@ func extractConfigFromFile(ctx context.Context, configFile string) map[string]an
 // 2. YAML in CLI parameter ("--config"),
 // gives higher priority to YAML in CLI parameter
 func mergeYAMLConfigs(fileYAML, parameterYAML map[string]any) map[string]any {
-	for k, v := range parameterYAML {
-		if val, ok := fileYAML[k]; ok {
-			dstMap, dstOk := val.(map[string]any)
-			srcMap, srcOk := v.(map[string]any)
-			if dstOk && srcOk {
-				fileYAML[k] = mergeYAMLConfigs(dstMap, srcMap)
+	for parameterKey, parameterValue := range parameterYAML {
+		if fileYAMLValue, ok := fileYAML[parameterKey]; ok {
+			fileYAMLMap, fileYAMLOk := fileYAMLValue.(map[string]any)
+			parameterYAMLMap, parameterYAMLOk := parameterValue.(map[string]any)
+			if fileYAMLOk && parameterYAMLOk {
+				fileYAML[parameterKey] = mergeYAMLConfigs(fileYAMLMap, parameterYAMLMap)
 				continue
 			}
 		}
-		fileYAML[k] = v
+		fileYAML[parameterKey] = parameterValue
 	}
 	return fileYAML
 }
 
-// Update values from YAML only when:
+// updateSidecarConfig updates value from YAML only when:
 // 1. YAML config contains non-zero value
 // 2. sidecar config contains value not explicitely set by flag
+// i.e. gives higher priority to config provided individually through flags (e.g. `--port`, `--vllm-port`) over YAML
 func (s *SidecarConfig) updateSidecarConfig(ctx context.Context, configMap configMap) {
 	logger := log.FromContext(ctx)
 	if configMap["port"] != nil {
-		if v, ok := configMap["port"].(int); ok {
+		if v, ok := configMap["port"].(float64); ok {
 			if s.Port == defaultPort {
-				s.Port = v
+				s.Port = int(v)
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "port", configMap["port"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["vllm-port"] != nil {
-		if v, ok := configMap["vllm-port"].(int); ok {
+		if v, ok := configMap["vllm-port"].(float64); ok {
 			if s.VLLMPort == defaultvLLMPort {
-				s.VLLMPort = v
+				s.VLLMPort = int(v)
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "vllm-port", configMap["vllm-port"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["connector"] != nil {
 		if v, ok := configMap["connector"].(string); ok {
 			if isDefault("connector") {
 				s.Connector = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "connector", configMap["connector"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
+	// TODO: isdefault or defaultvalue
 	if configMap["data-parallel-size"] != nil {
-		if v, ok := configMap["data-parallel-size"].(int); ok {
+		if v, ok := configMap["data-parallel-size"].(float64); ok {
 			if isDefault("data-parallel-size") {
-				s.VLLMDataParallelSize = v
+				s.VLLMDataParallelSize = int(v)
 			}
 		} else {
-			logger.Error(nil, "Type assertion failed")
+			logger.Error(nil, "Type assertion failed", "data-parallel-size", configMap["data-parallel-size"])
 		}
 	}
 	if configMap["prefiller-use-tls"] != nil {
@@ -314,86 +330,96 @@ func (s *SidecarConfig) updateSidecarConfig(ctx context.Context, configMap confi
 				s.PrefillerUseTLS = v
 			}
 		}
-		logger.Error(nil, "Type assertion failed")
+		// logger.Error(nil, "Type assertion failed. Got data of type %T but wanted bool", configMap["prefiller-use-tls"])
 	}
 	if configMap["decoder-use-tls"] != nil {
 		if v, ok := configMap["decoder-use-tls"].(bool); ok {
 			if isDefault("decoder-use-tls") {
 				s.DecoderUseTLS = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "decoder-use-tls", configMap["decoder-use-tls"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["prefiller-tls-insecure-skip-verify"] != nil {
 		if v, ok := configMap["prefiller-tls-insecure-skip-verify"].(bool); ok {
 			if isDefault("prefiller-tls-insecure-skip-verify") {
 				s.PrefillerInsecureSkipVerify = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "prefiller-tls-insecure-skip-verify", configMap["prefiller-tls-insecure-skip-verify"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["decoder-tls-insecure-skip-verify"] != nil {
 		if v, ok := configMap["decoder-tls-insecure-skip-verify"].(bool); ok {
 			if isDefault("decoder-tls-insecure-skip-verify") {
 				s.DecoderInsecureSkipVerify = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "decoder-tls-insecure-skip-verify", configMap["decoder-tls-insecure-skip-verify"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["secure-proxy"] != nil {
 		if v, ok := configMap["secure-proxy"].(bool); ok {
 			if isDefault("secure-proxy") {
 				s.SecureProxy = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "secure-proxy", configMap["secure-proxy"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["cert-path"] != nil {
 		if v, ok := configMap["cert-path"].(string); ok {
 			if isDefault("cert-path") {
 				s.CertPath = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "cert-path", configMap["cert-path"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["enable-ssrf-protection"] != nil {
 		if v, ok := configMap["enable-ssrf-protection"].(string); ok {
 			if isDefault("enable-ssrf-protection") {
 				s.CertPath = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "enable-ssrf-protection", configMap["enable-ssrf-protection"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["inference-pool-namespace"] != nil {
 		if v, ok := configMap["inference-pool-namespace"].(string); ok {
 			if isDefault("inference-pool-namespace") {
 				s.InferencePoolNamespace = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "inference-pool-namespace", configMap["inference-pool-namespace"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["inference-pool-name"] != nil {
 		if v, ok := configMap["inference-pool-name"].(string); ok {
 			if isDefault("inference-pool-name") {
 				s.InferencePoolName = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "inference-pool-name", configMap["inference-pool-name"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["enable-prefiller-sampling"] != nil {
 		if v, ok := configMap["enable-prefiller-sampling"].(bool); ok {
 			if isDefault("enable-prefiller-sampling") {
 				s.EnablePrefillerSampling = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "enable-prefiller-sampling", configMap["enable-prefiller-sampling"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 	if configMap["pool-group"] != nil {
 		if v, ok := configMap["pool-group"].(string); ok {
 			if isDefault("pool-group") {
 				s.PoolGroup = v
 			}
+		} else {
+			logger.Error(nil, "Type assertion failed", "pool-group", configMap["pool-group"])
 		}
-		logger.Error(nil, "Type assertion failed")
 	}
 }
