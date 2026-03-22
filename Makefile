@@ -237,6 +237,7 @@ image-build-uds-tokenizer: check-container-tool ## Build UDS tokenizer image fro
 image-build-%: check-container-tool ## Build Container image using $(CONTAINER_RUNTIME)
 	@printf "\033[33;1m==== Building Docker image $($*_IMAGE) ====\033[0m\n"
 	$(CONTAINER_RUNTIME) build \
+		--check \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \

@@ -79,6 +79,7 @@ spec:
         - "--kv-connector=nixlv2"
         - "--secure-proxy=false"
         - "--data-parallel-size=${VLLM_DATA_PARALLEL_SIZE}"
+        # - "--config=/etc/config/sidecar-config.yaml"
         ports:
         - name: sidecar-http
           containerPort: 8000
@@ -110,6 +111,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        volumeMounts:
+        - name: sidecar-config
+          mountPath: /etc/config
       containers:
       - name: vllm
         image: ${VLLM_SIMULATOR_IMAGE}
@@ -146,3 +150,7 @@ spec:
         env:
         - name: PORT
           value: "8200"
+      volumes:
+      - name: sidecar-config
+        configMap:
+          name: sidecar-config
