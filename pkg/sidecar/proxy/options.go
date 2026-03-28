@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -28,6 +29,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/yaml"
 )
+
+// var defaultTemp = make([]string, 20)
+
+var defaultTemp = []string{}
+var fileTemp = make([]string, 20)
+var inlineTemp = make([]string, 20)
+var flagTemp = make([]string, 20)
 
 // Options holds all configuration options for the pd-sidecar proxy.
 type Options struct {
@@ -63,12 +71,16 @@ type Options struct {
 	InferencePool               string // InferencePool in namespace/name or name format (e.g., default/my-pool or my-pool). A single name implies the 'default' namespace.
 
 	// Deprecated flag fields for InferencePool (kept for backward compatibility)
-	InferencePoolNamespace  string      // Deprecated: Use InferencePool instead. InferencePoolNamespace is the Kubernetes namespace to watch for InferencePool resources
-	InferencePoolName       string      // Deprecated: Use InferencePool instead. InferencePoolName is the specific InferencePool name to watch
-	EnablePrefillerSampling bool        // EnablePrefillerSampling enables random selection of prefill instances
-	PoolGroup               string      // PoolGroup is the group of the InferencePool this Endpoint Picker is associated with
-	LoggingOptions          zap.Options // LoggingOptions holds the zap logging configuration
-	FlagSet                 *pflag.FlagSet
+	InferencePoolNamespace          string      // Deprecated: Use InferencePool instead. InferencePoolNamespace is the Kubernetes namespace to watch for InferencePool resources
+	InferencePoolName               string      // Deprecated: Use InferencePool instead. InferencePoolName is the specific InferencePool name to watch
+	EnablePrefillerSampling         bool        // EnablePrefillerSampling enables random selection of prefill instances
+	PoolGroup                       string      // PoolGroup is the group of the InferencePool this Endpoint Picker is associated with
+	LoggingOptions                  zap.Options // LoggingOptions holds the zap logging configuration
+	FlagSet                         *pflag.FlagSet
+	ContainsDefaultValues           *[]string
+	ContainsFlags                   *[]string
+	ContainsYAMLInlineSpecification *[]string
+	ContainsYAMLFile                *[]string
 }
 
 type configurationMap map[string]any
@@ -126,19 +138,25 @@ func NewOptions() *Options {
 		enablePrefillerSampling = val
 	}
 
+	defaultTemp = []string{"port", "vllm-port", "data-parallel-size", "kv-connector", "ec-connector", "connector", "secure-proxy", "inference-pool", "inference-pool-namespace", "inference-pool-name", "enable-prefiller-sampling", "pool-group"}
+
 	return &Options{
-		Port:                    defaultPort,
-		VLLMPort:                defaultvLLMPort,
-		DataParallelSize:        defaultDataParallelSize,
-		KVConnector:             "",
-		ECConnector:             "",
-		Connector:               KVConnectorNIXLV2,
-		SecureProxy:             true,
-		InferencePool:           os.Getenv("INFERENCE_POOL"),
-		InferencePoolNamespace:  os.Getenv("INFERENCE_POOL_NAMESPACE"),
-		InferencePoolName:       os.Getenv("INFERENCE_POOL_NAME"),
-		EnablePrefillerSampling: enablePrefillerSampling,
-		PoolGroup:               DefaultPoolGroup,
+		Port:                            defaultPort,
+		VLLMPort:                        defaultvLLMPort,
+		DataParallelSize:                defaultDataParallelSize,
+		KVConnector:                     "",
+		ECConnector:                     "",
+		Connector:                       KVConnectorNIXLV2,
+		SecureProxy:                     true,
+		InferencePool:                   os.Getenv("INFERENCE_POOL"),
+		InferencePoolNamespace:          os.Getenv("INFERENCE_POOL_NAMESPACE"),
+		InferencePoolName:               os.Getenv("INFERENCE_POOL_NAME"),
+		EnablePrefillerSampling:         enablePrefillerSampling,
+		PoolGroup:                       DefaultPoolGroup,
+		ContainsDefaultValues:           &defaultTemp,
+		ContainsFlags:                   &fileTemp,
+		ContainsYAMLInlineSpecification: &inlineTemp,
+		ContainsYAMLFile:                &fileTemp,
 	}
 }
 
@@ -206,9 +224,22 @@ func validateStages(stages []string, supportedStages map[string]struct{}, flagNa
 // This handles migration from deprecated boolean flags to new StringSlice flags, extracts YAML configuration,
 // parses the InferencePool field, sets configuration fields from flag fields, and computes the target URL.
 func (opts *Options) Complete() error {
+	for i := 0; i < len(*opts.ContainsDefaultValues); i++ {
+		v := (*opts.ContainsDefaultValues)[i]
+		if !opts.isDefault(v) {
+			fmt.Printf(">>>4>>---%#v--\n", v)
+			remove(&defaultTemp, v)
+			i--
+			flagTemp = append(flagTemp, v)
+		}
+	}
 	if err := opts.extractYAMLConfiguration(opts.Configuration, opts.ConfigurationFile); err != nil {
 		return err
 	}
+	fmt.Printf(">>>7>>---%#v--\n", defaultTemp)
+	fmt.Printf(">>>8>>---%#v--\n", flagTemp)
+	fmt.Printf(">>>9>>---%#v--\n", inlineTemp)
+	fmt.Printf(">>>10>>---%#v--\n", fileTemp)
 
 	// Migrate deprecated Connector flag to KVConnector
 	if opts.Connector != "" && opts.KVConnector == "" {
@@ -327,6 +358,20 @@ func (opts *Options) Validate() error {
 	return nil
 }
 
+func removeDuplicates(fileTemp *[]string, inlineTemp []string) {
+	inlineMap := make(map[string]bool)
+	for _, item := range inlineTemp {
+		inlineMap[item] = true
+	}
+	filtered := (*fileTemp)[:0]
+	for _, item := range *fileTemp {
+		if !inlineMap[item] {
+			filtered = append(filtered, item)
+		}
+	}
+	*fileTemp = filtered
+}
+
 // extractYAMLConfiguration extracts sidecar configuration (if provided)
 // from `--configuration` and `--configuration-file` parameters
 func (opts *Options) extractYAMLConfiguration(configuration string, configurationFile string) error {
@@ -344,15 +389,108 @@ func (opts *Options) extractYAMLConfiguration(configuration string, configuratio
 			return err
 		}
 	}
+
 	switch {
+
+	// No inline specification and no file data
 	case configurationMap1 != nil && configurationMap2 != nil:
-		opts.updateSidecarConfiguration(mergeYAMLConfigurations(configurationMap2, configurationMap1))
+		if len(configurationMap1) != 0 && len(configurationMap2) != 0 {
+			err = opts.updateSidecarConfiguration(mergeYAMLConfigurations(configurationMap2, configurationMap1))
+			if err != nil {
+				return err
+			}
+			for key := range configurationMap1 {
+				inlineTemp = append(inlineTemp, key)
+			}
+			for key := range configurationMap2 {
+				fileTemp = append(fileTemp, key)
+			}
+
+			// compare inline and file
+			// remove duplicates from file
+			// fmt.Println("Original fileTemp:", fileTemp)
+			// removeDuplicates(&fileTemp, &inlineTemp)
+			// fmt.Println("New fileTemp:", fileTemp)
+
+			// fmt.Println("Before inline:", inlineTemp)
+			// fmt.Println("Before filetemp:", fileTemp)
+			// removeDuplicates(&fileTemp, inlineTemp)
+			// fmt.Println("After filetemp:", fileTemp)
+
+			// compare flag and inline
+			// remove duplicates from inline
+			// fmt.Println("Before flagTemp:", flagTemp)
+			// fmt.Println("Before inlineTemp:", inlineTemp)
+			// removeDuplicates(&inlineTemp, flagTemp)
+			// fmt.Println("After inlineTemp:", inlineTemp)
+
+			// fmt.Println("Original inlineTemp:", inlineTemp)
+			// fmt.Println("flagTemp:", flagTemp)
+			// fmt.Println("Result:", result2)
+
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-101-DEFAULT-%#v\n", defaultTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-102-FLAG-%#v\n", flagTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-103-INLINE-%#v\n", inlineTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-104-FILE-%#v\n", fileTemp)
+		}
+
+	// Only inline specification has data
+	// No file data
 	case configurationMap1 != nil && configurationMap2 == nil:
-		opts.updateSidecarConfiguration(configurationMap1)
+		if len(configurationMap1) != 0 {
+			err = opts.updateSidecarConfiguration(configurationMap1)
+			if err != nil {
+				return err
+			}
+			// opts.ContainsYAMLInlineSpecification = true
+			// opts.ContainsYAMLFile = false
+			for key := range configurationMap1 {
+				inlineTemp = append(inlineTemp, key)
+			}
+
+			// compare flag and inline
+			// remove duplicates from inline
+			// fmt.Println("Before flagTemp:", flagTemp)
+			// fmt.Println("Before inlineTemp:", inlineTemp)
+			// removeDuplicates(&inlineTemp, flagTemp)
+			// fmt.Println("After inlineTemp:", inlineTemp)
+
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-201-DEFAULT-%#v\n", defaultTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-202-FLAG-%#v\n", flagTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-203-INLINE-%#v\n", inlineTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-204-FILE-%#v\n", fileTemp)
+		}
+
+	// No inline specification data
+	// Only file data
 	case configurationMap1 == nil && configurationMap2 != nil:
-		opts.updateSidecarConfiguration(configurationMap2)
+		if len(configurationMap2) != 0 {
+			err = opts.updateSidecarConfiguration(configurationMap2)
+			if err != nil {
+				return err
+			}
+			for key := range configurationMap2 {
+				fileTemp = append(fileTemp, key)
+			}
+			// opts.ContainsYAMLInlineSpecification = false
+			// opts.ContainsYAMLFile = true
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-301-DEFAULT-%#v\n", defaultTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-302-FLAG-%#v\n", flagTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-303-INLINE-%#v\n", inlineTemp)
+			fmt.Printf("AAAAAAAAAAAAAAAAAAAA-304-FILE-%#v\n", fileTemp)
+
+			// remove duplicates from fileTemp
+			// compare file and flag
+			// fmt.Println("Before flagTemp:", flagTemp)
+			// fmt.Println("Before fileTemp:", fileTemp)
+			// removeDuplicates(&inlineTemp, fileTemp)
+			// fmt.Println("After fileTemp:", inlineTemp)
+		}
+
+	// No inline specification and no file data
 	default:
-		break
+		// opts.ContainsYAMLInlineSpecification = false
+		// opts.ContainsYAMLFile = false
 	}
 	return nil
 }
@@ -360,7 +498,11 @@ func (opts *Options) extractYAMLConfiguration(configuration string, configuratio
 // isDefault checks if flag contains default or parsed value
 func (o *Options) isDefault(parameter string) bool {
 	flag := o.FlagSet.Lookup(parameter)
-	return flag == nil || !flag.Changed
+	result := flag == nil || !flag.Changed
+	if result {
+		// o.ContainsDefaultValues = true
+	}
+	return result
 }
 
 // YAMLConfigurationFromInlineSpecification extracts YAML configuration provided as inline specification
@@ -394,7 +536,12 @@ func YAMLConfigurationFromFile(configFile string) (map[string]any, error) {
 // 2. YAML configuration provided as inline specification `--configuration“,
 // and gives higher priority to configuration provided in inline specification `--configuration`
 func mergeYAMLConfigurations(fileYAML, parameterYAML map[string]any) map[string]any {
+	for fileKey := range fileYAML {
+		fileTemp = append(fileTemp, fileKey)
+	}
 	for parameterKey, parameterValue := range parameterYAML {
+		inlineTemp = append(inlineTemp, parameterKey)
+		fmt.Printf("AAAAAAAAAAAAAAAAAAAA-700-%#v\n", inlineTemp)
 		if fileYAMLValue, ok := fileYAML[parameterKey]; ok {
 			fileYAMLMap, fileYAMLOk := fileYAMLValue.(map[string]any)
 			parameterYAMLMap, parameterYAMLOk := parameterValue.(map[string]any)
@@ -405,7 +552,31 @@ func mergeYAMLConfigurations(fileYAML, parameterYAML map[string]any) map[string]
 		}
 		fileYAML[parameterKey] = parameterValue
 	}
+	removeDuplicates(&fileTemp, inlineTemp)
+	fmt.Printf("\n\n\nAAAAAAAAAAAAAAAAAAAA-11-DEFAULT-%#v\n", defaultTemp)
+	fmt.Printf("AAAAAAAAAAAAAAAAAAAA-22-FLAG-%#v\n", flagTemp)
+	fmt.Printf("AAAAAAAAAAAAAAAAAAAA-33-INLINE-%#v\n", inlineTemp)
+	fmt.Printf("AAAAAAAAAAAAAAAAAAAA-44-FILE-%#v\n\n\n", fileTemp)
 	return fileYAML
+}
+
+// remove() removes all occurrences in-place (more memory efficient)
+func remove(slice *[]string, value string) {
+	filtered := (*slice)[:0]
+	for _, v := range *slice {
+		if v != value {
+			filtered = append(filtered, v)
+		}
+	}
+
+	fmt.Printf("++++++++++++++++++++++++++++++++++++----%#v", filtered)
+	*slice = filtered
+}
+
+func appendKey(slice *[]string, element string) {
+	if !slices.Contains(*slice, element) {
+		*slice = append(*slice, element)
+	}
 }
 
 // updateSidecarConfiguration updates value from YAML only when:
@@ -417,6 +588,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["port"].(float64); ok {
 			if opts.isDefault("port") {
 				opts.Port = strconv.Itoa(int(v))
+				remove(&defaultTemp, "port")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1001-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1002-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1003-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1004-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "port")
+				appendKey(&flagTemp, "port")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1005-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1006-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1007-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1008-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for port: " + fmt.Sprintf("%v", configurationMap["port"]))
@@ -426,6 +609,20 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["vllm-port"].(float64); ok {
 			if opts.isDefault("vllm-port") {
 				opts.VLLMPort = strconv.Itoa(int(v))
+				remove(&defaultTemp, "vllm-port")
+				//remove(fileTemp, "vllm-port")
+				//remove(inlineTemp, "vllm-port")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1009-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1010-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1011-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1012-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "vllm-port")
+				appendKey(&flagTemp, "vllm-port")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1013-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1014-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1015-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1016-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for vllm-port: " + fmt.Sprintf("%v", configurationMap["vllm-port"]))
@@ -435,6 +632,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["data-parallel-size"].(float64); ok {
 			if opts.isDefault("data-parallel-size") {
 				opts.DataParallelSize = int(v)
+				remove(&defaultTemp, "data-parallel-size")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1017-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1018-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1019-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1020-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "data-parallel-size")
+				appendKey(&flagTemp, "data-parallel-size")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1021-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1022-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1023-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1024-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for data-parallel-size: " + fmt.Sprintf("%v", configurationMap["data-parallel-size"]))
@@ -444,6 +653,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["connector"].(string); ok {
 			if opts.isDefault("connector") {
 				opts.Connector = v
+				remove(&defaultTemp, "connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1025-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1026-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1027-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1028-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "connector")
+				appendKey(&flagTemp, "connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1029-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1030-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1031-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1032-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for connector: " + fmt.Sprintf("%v", configurationMap["connector"]))
@@ -453,6 +674,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["kv-connector"].(string); ok {
 			if opts.isDefault("kv-connector") {
 				opts.KVConnector = v
+				remove(&defaultTemp, "kv-connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1033-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1034-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1035-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1036-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "kv-connector")
+				appendKey(&flagTemp, "kv-connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1037-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1038-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1039-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1040-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for kv-connector: " + fmt.Sprintf("%v", configurationMap["kv-connector"]))
@@ -462,6 +695,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["ec-connector"].(string); ok {
 			if opts.isDefault("ec-connector") {
 				opts.ECConnector = v
+				remove(&defaultTemp, "ec-connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1041-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1042-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1043-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1044-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "ec-connector")
+				appendKey(&flagTemp, "ec-connector")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1045-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1046-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1047-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1048-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for ec-connector: " + fmt.Sprintf("%v", configurationMap["ec-connector"]))
@@ -483,6 +728,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["prefiller-use-tls"].(bool); ok {
 			if opts.isDefault("prefiller-use-tls") {
 				opts.PrefillerUseTLS = v
+				remove(&defaultTemp, "prefiller-use-tls")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1049-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1050-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1051-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1052-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "prefiller-use-tls")
+				appendKey(&flagTemp, "prefiller-use-tls")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1053-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1054-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1055-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1056-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for prefiller-use-tls: " + fmt.Sprintf("%v", configurationMap["prefiller-use-tls"]))
@@ -492,6 +749,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["decoder-use-tls"].(bool); ok {
 			if opts.isDefault("decoder-use-tls") {
 				opts.DecoderUseTLS = v
+				remove(&defaultTemp, "decoder-use-tls")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1057-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1058-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1059-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1060-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "decoder-use-tls")
+				appendKey(&flagTemp, "decoder-use-tls")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1061-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1062-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1063-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1064-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for decoder-use-tls: " + fmt.Sprintf("%v", configurationMap["decoder-use-tls"]))
@@ -501,6 +770,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["tls-insecure-skip-verify"].(bool); ok {
 			if opts.isDefault("tls-insecure-skip-verify") {
 				opts.PrefillerInsecureSkipVerify = v
+				remove(&defaultTemp, "tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1065-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1066-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1067-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1068-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "tls-insecure-skip-verify")
+				appendKey(&flagTemp, "tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1069-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1070-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1071-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1072-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for tls-insecure-skip-verify: " + fmt.Sprintf("%v", configurationMap["tls-insecure-skip-verify"]))
@@ -510,6 +791,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["prefiller-tls-insecure-skip-verify"].(bool); ok {
 			if opts.isDefault("prefiller-tls-insecure-skip-verify") {
 				opts.PrefillerInsecureSkipVerify = v
+				remove(&defaultTemp, "prefiller-tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1073-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1074-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1075-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1076-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "prefiller-tls-insecure-skip-verify")
+				appendKey(&flagTemp, "prefiller-tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1077-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1078-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1079-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1080-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for prefiller-tls-insecure-skip-verify: " + fmt.Sprintf("%v", configurationMap["prefiller-tls-insecure-skip-verify"]))
@@ -519,6 +812,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["decoder-tls-insecure-skip-verify"].(bool); ok {
 			if opts.isDefault("decoder-tls-insecure-skip-verify") {
 				opts.DecoderInsecureSkipVerify = v
+				remove(&defaultTemp, "decoder-tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1081-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1082-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1083-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1084-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "decoder-tls-insecure-skip-verify")
+				appendKey(&flagTemp, "decoder-tls-insecure-skip-verify")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1085-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1086-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1087-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1088-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for decoder-tls-insecure-skip-verify: " + fmt.Sprintf("%v", configurationMap["decoder-tls-insecure-skip-verify"]))
@@ -528,6 +833,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["secure-proxy"].(bool); ok {
 			if opts.isDefault("secure-proxy") {
 				opts.SecureProxy = v
+				remove(&defaultTemp, "secure-proxy")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1089-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1090-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1091-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1092-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "secure-proxy")
+				appendKey(&flagTemp, "secure-proxy")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-1093-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-1094-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-1095-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-1096-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for secure-proxy: " + fmt.Sprintf("%v", configurationMap["secure-proxy"]))
@@ -537,6 +854,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["cert-path"].(string); ok {
 			if opts.isDefault("cert-path") {
 				opts.CertPath = v
+				remove(&defaultTemp, "cert-path")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "cert-path")
+				appendKey(&flagTemp, "cert-path")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for cert-path: " + fmt.Sprintf("%v", configurationMap["cert-path"]))
@@ -546,6 +875,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["enable-ssrf-protection"].(bool); ok {
 			if opts.isDefault("enable-ssrf-protection") {
 				opts.EnableSSRFProtection = v
+				remove(&defaultTemp, "enable-ssrf-protection")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "enable-ssrf-protection")
+				appendKey(&flagTemp, "enable-ssrf-protection")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for enable-ssrf-protection: " + fmt.Sprintf("%v", configurationMap["enable-ssrf-protection"]))
@@ -555,6 +896,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["inference-pool"].(string); ok {
 			if opts.isDefault("inference-pool") {
 				opts.InferencePool = v
+				remove(&defaultTemp, "inference-pool")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "inference-pool")
+				appendKey(&flagTemp, "inference-pool")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for inference-pool: " + fmt.Sprintf("%v", configurationMap["inference-pool"]))
@@ -564,6 +917,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["inference-pool-namespace"].(string); ok {
 			if opts.isDefault("inference-pool-namespace") {
 				opts.InferencePoolNamespace = v
+				remove(&defaultTemp, "inference-pool-namespace")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "inference-pool-namespace")
+				appendKey(&flagTemp, "inference-pool-namespace")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for inference-pool-namespace: " + fmt.Sprintf("%v", configurationMap["inference-pool-namespace"]))
@@ -573,6 +938,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["inference-pool-name"].(string); ok {
 			if opts.isDefault("inference-pool-name") {
 				opts.InferencePoolName = v
+				remove(&defaultTemp, "inference-pool-name")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "inference-pool-name")
+				appendKey(&flagTemp, "inference-pool-name")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for inference-pool-name: " + fmt.Sprintf("%v", configurationMap["inference-pool-name"]))
@@ -582,6 +959,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["enable-prefiller-sampling"].(bool); ok {
 			if opts.isDefault("enable-prefiller-sampling") {
 				opts.EnablePrefillerSampling = v
+				remove(&defaultTemp, "enable-prefiller-sampling")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "enable-prefiller-sampling")
+				appendKey(&flagTemp, "enable-prefiller-sampling")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for enable-prefiller-sampling: " + fmt.Sprintf("%v", configurationMap["enable-prefiller-sampling"]))
@@ -591,6 +980,18 @@ func (opts *Options) updateSidecarConfiguration(configurationMap configurationMa
 		if v, ok := configurationMap["pool-group"].(string); ok {
 			if opts.isDefault("pool-group") {
 				opts.PoolGroup = v
+				remove(&defaultTemp, "pool-group")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-5-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-6-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-7-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-8-%#v\n", fileTemp)
+			} else {
+				remove(&defaultTemp, "pool-group")
+				appendKey(&flagTemp, "pool-group")
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-DEFAULT-17-%#v\n", defaultTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FLAG-18-%#v\n", flagTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-INLINE-19-%#v\n", inlineTemp)
+				fmt.Printf("AAAAAAAAAAAAAAAAAAAA-FILE-20-%#v\n", fileTemp)
 			}
 		} else {
 			return errors.New("Type assertion failed for pool-group: " + fmt.Sprintf("%v", configurationMap["pool-group"]))

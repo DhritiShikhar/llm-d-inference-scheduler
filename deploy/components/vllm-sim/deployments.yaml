@@ -24,6 +24,9 @@ spec:
         - "--kv-connector=nixlv2"
         - "--secure-proxy=false"
         - "--data-parallel-size=${VLLM_DATA_PARALLEL_SIZE}"
+        # - "--configuration={port:8090}"
+        - "--configuration={port: 8085, vllm-port: 8203}"
+        # - "--configuration-file=/etc/config/sidecar-config.yaml"
         ports:
         - name: sidecar-http
           containerPort: 8000
@@ -50,6 +53,9 @@ spec:
           containerPort: 8007
           protocol: TCP
         restartPolicy: Always
+        volumeMounts:
+          - name: sidecar-config
+            mountPath: /etc/config
         env:
         - name: POD_IP
           valueFrom:
@@ -109,4 +115,7 @@ spec:
       volumes:
       - name: tokenizer-cache
         emptyDir: {}
+      - name: sidecar-config
+        configMap:
+          name: sidecar-config
 

@@ -1,0 +1,8 @@
+port: 9001
+vllm-port: 8201
+kv-connector: "sglang"
+connector: "shared-storage"
+ec-connector: "ec-example"
+secure-proxy: false
+data-parallel-size: 7
+decoder-use-tls: false 

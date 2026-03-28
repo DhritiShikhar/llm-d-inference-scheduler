@@ -56,7 +56,6 @@ func main() {
 			}
 		}()
 	}
-
 	// Complete options (handles migration from deprecated flags)
 	if err := opts.Complete(); err != nil {
 		logger.Error(err, "Failed to complete configuration")
@@ -67,6 +66,37 @@ func main() {
 	if err := opts.Validate(); err != nil {
 		logger.Error(err, "Invalid configuration")
 		return
+	}
+
+	logger.Info("Sidecar configuration",
+		"port", opts.Port,
+		"targetURL", opts.TargetURL,
+		"kvConnector", opts.KVConnector,
+		"ecConnector", opts.ECConnector,
+		"dataParallelSize", opts.DataParallelSize,
+		"prefillerUseTLS", opts.PrefillerUseTLS,
+		"prefillerInsecureSkipVerify", opts.PrefillerInsecureSkipVerify,
+		"decoderInsecureSkipVerify", opts.DecoderInsecureSkipVerify,
+		"enablePrefillerSampling", opts.EnablePrefillerSampling,
+		"secureProxy", opts.SecureProxy,
+		"certPath", opts.CertPath,
+		"enableSSRFProtection", opts.EnableSSRFProtection,
+		"inferencePoolNamespace", opts.InferencePoolNamespace,
+		"inferencePoolName", opts.InferencePoolName,
+		"poolGroup", opts.PoolGroup,
+	)
+
+	if *opts.ContainsDefaultValues != nil {
+		logger.Info("Sidecar configuration", "Default values", opts.ContainsDefaultValues)
+	}
+	if *opts.ContainsFlags != nil {
+		logger.Info("Sidecar configuration", "Flags", opts.ContainsFlags)
+	}
+	if *opts.ContainsYAMLInlineSpecification != nil {
+		logger.Info("Sidecar configuration", "YAML inline specification", opts.ContainsYAMLInlineSpecification)
+	}
+	if *opts.ContainsYAMLFile != nil {
+		logger.Info("Sidecar configuration", "YAML inline specification", opts.ContainsYAMLFile)
 	}
 
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)

@@ -33,9 +33,10 @@ import (
 
 var validSidecarfilePath, invalidSidecarfilePath string
 
-// createSidecarConfigurationYAMLFiles creates sidecar configuration files with valid and invalid YAML
-func createSidecarConfigurationYAMLFiles(t *testing.T) {
+// createSidecarConfigurationWithValidYAML creates sidecar configuration file with valid YAML
+func createSidecarConfigurationWithValidYAML(t *testing.T) {
 	tempDir := t.TempDir()
+
 	validYAML := []byte(`
 port: 8083
 vllm-port: 8201
@@ -50,25 +51,34 @@ enable-tls:
 - decoder
 - encoder
 `)
-	invalidYAML := []byte(`
-port: 8083
-vllm-port: 8201
-*&&&&&&#######!!
-`)
-	// create sidecar configuration file with valid YAML
+
 	validSidecarfilePath = filepath.Join(tempDir, "sidecar-configuration-valid.yaml")
 	err := os.WriteFile(validSidecarfilePath, validYAML, 0644)
 	if err != nil {
 		t.Fatalf("failed to write sidecar configuration file: %v", err)
 	}
-	// create sidecar configuration file with invalid YAML
+}
+
+// createSidecarConfigurationWithInvalidYAML creates sidecar configuration files with invalid YAML
+func createSidecarConfigurationWithInvalidYAML(t *testing.T) {
+	tempDir := t.TempDir()
+
+	invalidYAML := []byte(`
+port: 8083
+vllm-port: 8201
+*&&&&&&#######!!
+`)
+
 	invalidSidecarfilePath = filepath.Join(tempDir, "sidecar-configuration-invalid.yaml")
-	err = os.WriteFile(invalidSidecarfilePath, invalidYAML, 0644)
+	err := os.WriteFile(invalidSidecarfilePath, invalidYAML, 0644)
 	if err != nil {
 		t.Fatalf("failed to write sidecar configuration file: %v", err)
 	}
 }
 
+// newTestOptions creates:
+// 1. new flag set for test
+// 2. new Options struct initialized with default values
 func newTestOptions(t *testing.T) (*Options, *pflag.FlagSet) {
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	testFlagSet := pflag.NewFlagSet(t.Name(), pflag.ContinueOnError)
@@ -83,13 +93,13 @@ func newTestOptions(t *testing.T) (*Options, *pflag.FlagSet) {
 // case 2: configuration provided individually through flags (e.g `--port`, `--vllm-port`)
 // case 3: YAML configuration provided through inline specification `--configuration`
 // case 4: YAML configuration provided through file `--configuration-file`
-// case 5: case 2 + case 3 i.e. configuration provided through individual flags + YAML inline specification
-// case 6: case 2 + case 4 i.e. configuration provided through individual flags + file
-// case 7: case 3 + case 4 i.e. configuration provided through YAML inline specification + file
-// case 8: case 2 + case 3 + case 4 i.e. configuration provided through individual flags + YAML inline specification + file
+// case 5: case 2 + case 3 i.e. configuration provided through individual flags + YAML inline specification (individual flags have higher priority)
+// case 6: case 2 + case 4 i.e. configuration provided through individual flags + file (individual flags have higher priority)
+// case 7: case 3 + case 4 i.e. configuration provided through YAML inline specification + file (YAML inline specification has higher priority)
+// case 8: case 2 + case 3 + case 4 i.e. configuration provided through individual flags + YAML inline specification + file (individual flags have highest priority, then inline specification, then file)
 // case 9: invalid YAML configuration provided through inline specification `--configuration`
 // case 10: invalid YAML configuration provided through file `--configuration-file`
-func TestSidecarConfig(t *testing.T) {
+func TestSidecarConfiguration(t *testing.T) {
 	port := "8100"
 	inlinePort := "8200"
 	vllmPort := "7100"
@@ -109,7 +119,8 @@ func TestSidecarConfig(t *testing.T) {
 	configuration := "{port: 8200, vllm-port: 7200, kv-connector: sglang, enableTLS: 'prefiller,decoder'}"
 	invalidConfiguration := "{port: 8200, vllm-port: 'sh'"
 	expectedError := errors.New("Failed to unmarshal sidecar configuration")
-	createSidecarConfigurationYAMLFiles(t)
+	createSidecarConfigurationWithValidYAML(t)
+	createSidecarConfigurationWithInvalidYAML(t)
 
 	tests := []struct {
 		name                         string
@@ -127,7 +138,11 @@ func TestSidecarConfig(t *testing.T) {
 		expectedUseTLSForPrefiller   bool
 		expectedUseTLSForEncoder     bool
 		expectedError                error
-		inputFlags                   map[string]any
+		// expectedContainsDefaultValues           bool
+		// expectedContainsFlags                   bool
+		// expectedContainsYAMLInlineSpecification bool
+		// expectedContainsYAMLFile                bool
+		inputFlags map[string]any
 	}{
 		{
 			name:                         "case 1: no sidecar configuration provided by user i.e. default values are used",
@@ -145,7 +160,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     false,
 			expectedConfig:               "",
 			expectedConfigFile:           "",
-			expectedError:                nil,
+			// expectedContainsDefaultValues:           true,
+			// expectedContainsFlags:                   false,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                false,
+			expectedError: nil,
 		},
 		{
 			name: "case 2: configuration provided individually through flags (e.g `--port`, `--vllm-port`)",
@@ -172,7 +191,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     false,
 			expectedConfig:               "",
 			expectedConfigFile:           "",
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                false,
+			expectedError: nil,
 		},
 		{
 			name: "case 3: YAML configuration provided through inline specification `--configuration`",
@@ -192,7 +215,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     false,
 			expectedConfig:               configuration,
 			expectedConfigFile:           "",
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: true,
+			// expectedContainsYAMLFile:                false,
+			expectedError: nil,
 		},
 		{
 			name: "case 4: YAML configuration provided through file `--configuration-file`",
@@ -212,7 +239,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     true,
 			expectedConfig:               "",
 			expectedConfigFile:           validSidecarfilePath,
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                true,
+			expectedError: nil,
 		},
 		{
 			name: "case 5: case 2 + case 3 i.e. configuration provided through individual flags + YAML inline specification",
@@ -235,7 +266,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     true,
 			expectedConfig:               configuration,
 			expectedConfigFile:           "",
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: true,
+			// expectedContainsYAMLFile:                false,
+			expectedError: nil,
 		},
 		{
 			name: "case 6: case 2 + case 4 i.e. configuration provided through individual flags + file",
@@ -259,7 +294,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     true,
 			expectedConfig:               "",
 			expectedConfigFile:           validSidecarfilePath,
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                true,
+			expectedError: nil,
 		},
 		{
 			name: "case 7: case 3 + case 4 i.e. configuration provided through YAML inline specification + file",
@@ -280,7 +319,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     true,
 			expectedConfig:               configuration,
 			expectedConfigFile:           validSidecarfilePath,
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: true,
+			// expectedContainsYAMLFile:                true,
+			expectedError: nil,
 		},
 		{
 			name: "case 8: case 2 + case 3 + case 4 i.e. configuration provided through individual flags + YAML inline specification + file",
@@ -303,7 +346,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     true,
 			expectedConfig:               configuration,
 			expectedConfigFile:           validSidecarfilePath,
-			expectedError:                nil,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: true,
+			// expectedContainsYAMLFile:                true,
+			expectedError: nil,
 		},
 		{
 			name: "case 9: invalid YAML configuration provided through inline specification `--configuration`",
@@ -323,7 +370,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:     false,
 			expectedConfig:               invalidConfiguration,
 			expectedConfigFile:           "",
-			expectedError:                expectedError,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                false,
+			expectedError: expectedError,
 		},
 		{
 			name: "case 10: invalid YAML configuration provided through file `--configuration-file`",
@@ -341,7 +392,11 @@ func TestSidecarConfig(t *testing.T) {
 			expectedUseTLSForEncoder:   false,
 			expectedConfig:             "",
 			expectedConfigFile:         "",
-			expectedError:              expectedError,
+			// expectedContainsDefaultValues: true,
+			// // expectedContainsFlags:                   true,
+			// expectedContainsYAMLInlineSpecification: false,
+			// expectedContainsYAMLFile:                false,
+			expectedError: expectedError,
 		},
 	}
 	for _, tt := range tests {
@@ -411,6 +466,18 @@ func TestSidecarConfig(t *testing.T) {
 					t.Errorf("%v type is unknown, value: %v\n", tt.inputFlags["enable-tls"], v)
 				}
 			}
+			// if tt.expectedContainsDefaultValues {
+			// 	require.True(t, opts.ContainsDefaultValues)
+			// }
+			// if tt.expectedContainsFlags {
+			// 	require.True(t, opts.ContainsFlags)
+			// }
+			// if tt.expectedContainsYAMLInlineSpecification {
+			// 	require.True(t, opts.ContainsYAMLInlineSpecification)
+			// }
+			// if tt.expectedContainsYAMLFile {
+			// 	require.True(t, opts.ContainsYAMLFile)
+			// }
 		})
 	}
 }

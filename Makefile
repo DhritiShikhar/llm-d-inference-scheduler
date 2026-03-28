@@ -237,13 +237,14 @@ image-build-uds-tokenizer: check-container-tool ## Build UDS tokenizer image fro
 image-build-%: check-container-tool ## Build Container image using $(CONTAINER_RUNTIME)
 	@printf "\033[33;1m==== Building Docker image $($*_IMAGE) ====\033[0m\n"
 	$(CONTAINER_RUNTIME) build \
+		--progress=plain \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
 		--build-arg COMMIT_SHA=${GIT_COMMIT_SHA} \
 		--build-arg BUILD_REF=${BUILD_REF} \
 		--build-arg LDFLAGS="$(LDFLAGS)" \
-		-t $($*_IMAGE) -f Dockerfile.$* .
+		-t $($*_IMAGE) -f Dockerfile.$* . 2>&1
 
 .PHONY: image-push
 image-push: image-push-epp image-push-sidecar ## Push container images to registry using $(CONTAINER_RUNTIME)
