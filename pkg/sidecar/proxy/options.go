@@ -32,7 +32,62 @@ import (
 	"go.uber.org/zap/zapcore"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
+	"sigs.k8s.io/yaml"
 )
+
+const (
+	// Flags
+	port                    = "port"
+	vllmPort                = "vllm-port"
+	dataParallelSize        = "data-parallel-size"
+	kvConnector             = "kv-connector"
+	ecConnector             = "ec-connector"
+	enableSSRFProtection    = "enable-ssrf-protection"
+	enablePrefillerSampling = "enable-prefiller-sampling"
+	enableTLS               = "enable-tls"
+	tlsInsecureSkipVerify   = "tls-insecure-skip-verify"
+	secureServing           = "secure-proxy"
+	certPath                = "cert-path"
+	poolGroup               = "pool-group"
+	configuration           = "configuration"
+	configurationFile       = "configuration-file"
+	inferencePool           = "inference-pool"
+
+	// Deprecated flags
+	connector                      = "connector"
+	prefillerUseTLS                = "prefiller-use-tls"
+	decoderUseTLS                  = "decoder-use-tls"
+	prefillerTLSInsecureSkipVerify = "prefiller-tls-insecure-skip-verify"
+	decoderTLSInsecureSkipVerify   = "decoder-tls-insecure-skip-verify"
+	inferencePoolNamespace         = "inference-pool-namespace"
+	inferencePoolName              = "inference-pool-name"
+
+	// Environment variables
+	envInferencePool           = "INFERENCE_POOL"
+	envInferencePoolNamespace  = "INFERENCE_POOL_NAMESPACE"
+	envInferencePoolName       = "INFERENCE_POOL_NAME"
+	envEnablePrefillerSampling = "ENABLE_PREFILLER_SAMPLING"
+
+	// Defaults
+	defaultPort             = "8000"
+	defaultVLLMPort         = "8001"
+	defaultDataParallelSize = 1
+
+	// TLS stages
+	prefillStage = "prefiller"
+	decodeStage  = "decoder"
+	encodeStage  = "encoder"
+)
+
+type configurationMap map[string]any
+
+type configurationState struct {
+	FromEnv    []string
+	FromFlags  []string
+	FromInline []string
+	FromFile   []string
+	Defaults   []string
+}
 
 // Options holds the CLI-facing configuration for the pd-sidecar proxy.
 // It embeds Config which represents the complete processed runtime configuration.
@@ -59,15 +114,14 @@ type Options struct {
 	prefillerInsecureSkipVerify bool   // Deprecated: use --tls-insecure-skip-verify=prefiller instead
 	decoderInsecureSkipVerify   bool   // Deprecated: use --tls-insecure-skip-verify=decoder instead
 
-	loggingOptions zap.Options // loggingOptions holds the zap logging configuration
-}
+	loggingOptions                       zap.Options // loggingOptions holds the zap logging configuration
+	pflagSet                             *pflag.FlagSet
+	configurationFromInlineSpecification string
+	configurationFromFile                string
 
-const (
-	// TLS stages
-	prefillStage = "prefiller"
-	decodeStage  = "decoder"
-	encodeStage  = "encoder"
-)
+	// ConfigurationState lists configuration values from flags, environment variables, inline specification, file and default values
+	ConfigurationState configurationState
+}
 
 var (
 	// supportedKVConnectors defines all valid P/D KV connector types
@@ -97,23 +151,23 @@ var (
 // NewOptions returns a new Options struct initialized with default values.
 func NewOptions() *Options {
 	enablePrefillerSampling := false
-	if val, err := strconv.ParseBool(os.Getenv("ENABLE_PREFILLER_SAMPLING")); err == nil {
+	if val, err := strconv.ParseBool(os.Getenv(envEnablePrefillerSampling)); err == nil {
 		enablePrefillerSampling = val
 	}
 
 	return &Options{
 		Config: Config{
-			Port:                    "8000",
-			DataParallelSize:        1,
+			Port:                    defaultPort,
+			DataParallelSize:        defaultDataParallelSize,
 			SecureServing:           true,
 			EnablePrefillerSampling: enablePrefillerSampling,
 			MaxIdleConnsPerHost:     defaultMaxIdleConnsPerHost,
 			PoolGroup:               DefaultPoolGroup,
-			InferencePoolNamespace:  os.Getenv("INFERENCE_POOL_NAMESPACE"),
-			InferencePoolName:       os.Getenv("INFERENCE_POOL_NAME"),
+			InferencePoolNamespace:  os.Getenv(envInferencePoolNamespace),
+			InferencePoolName:       os.Getenv(envInferencePoolName),
 		},
-		vllmPort:      "8001",
-		inferencePool: os.Getenv("INFERENCE_POOL"),
+		vllmPort:      defaultVLLMPort,
+		inferencePool: os.Getenv(envInferencePool),
 		connector:     KVConnectorNIXLV2,
 	}
 }
@@ -121,47 +175,51 @@ func NewOptions() *Options {
 // AddFlags binds the Options fields to command-line flags on the given FlagSet.
 // It also sets up zap logging flags and integrates Go flags with pflag.
 func (opts *Options) AddFlags(fs *pflag.FlagSet) {
+	opts.pflagSet = fs
+	goFlagSet := flag.NewFlagSet("goFlagSet", flag.ContinueOnError)
+
 	// Add logging flags to the standard flag set
-	opts.loggingOptions.BindFlags(flag.CommandLine)
+	opts.loggingOptions.BindFlags(goFlagSet)
 
 	// Add Go flags to pflag (for zap options compatibility)
-	fs.AddGoFlagSet(flag.CommandLine)
+	fs.AddGoFlagSet(goFlagSet)
 
-	fs.StringVar(&opts.Port, "port", opts.Port, "the port the sidecar is listening on")
-	fs.StringVar(&opts.vllmPort, "vllm-port", opts.vllmPort, "the port vLLM is listening on")
-	fs.IntVar(&opts.DataParallelSize, "data-parallel-size", opts.DataParallelSize, "the vLLM DATA-PARALLEL-SIZE value")
-	fs.StringVar(&opts.KVConnector, "kv-connector", opts.KVConnector,
+	fs.StringVar(&opts.Port, port, opts.Port, "the port the sidecar is listening on")
+	fs.StringVar(&opts.vllmPort, vllmPort, opts.vllmPort, "the port vLLM is listening on")
+	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the vLLM DATA-PARALLEL-SIZE value")
+	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
 		"the KV protocol between prefiller and decoder. Supported: "+supportedKVConnectorNamesStr)
-	fs.StringVar(&opts.ECConnector, "ec-connector", opts.ECConnector,
+	fs.StringVar(&opts.ECConnector, ecConnector, opts.ECConnector,
 		"the EC protocol between encoder and prefiller (for EPD mode). Supported: "+supportedECConnectorNamesStr+". Leave empty to skip encoder stage.")
-	fs.BoolVar(&opts.SecureServing, "secure-proxy", opts.SecureServing, "Enables secure proxy. Defaults to true.")
-	fs.StringVar(&opts.CertPath, "cert-path", opts.CertPath, "The path to the certificate for secure proxy. The certificate and private key files are assumed to be named tls.crt and tls.key, respectively. If not set, and secureProxy is enabled, then a self-signed certificate is used (for testing).")
-	fs.BoolVar(&opts.EnableSSRFProtection, "enable-ssrf-protection", opts.EnableSSRFProtection, "enable SSRF protection using InferencePool allowlisting")
-	fs.BoolVar(&opts.EnablePrefillerSampling, "enable-prefiller-sampling", opts.EnablePrefillerSampling, "if true, the target prefill instance will be selected randomly from among the provided prefill host values")
-	fs.StringVar(&opts.PoolGroup, "pool-group", opts.PoolGroup, "group of the InferencePool this Endpoint Picker is associated with.")
+	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Enables secure proxy. Defaults to true.")
+	fs.StringVar(&opts.CertPath, certPath, opts.CertPath, "The path to the certificate for secure proxy. The certificate and private key files are assumed to be named tls.crt and tls.key, respectively. If not set, and secureProxy is enabled, then a self-signed certificate is used (for testing).")
+	fs.BoolVar(&opts.EnableSSRFProtection, enableSSRFProtection, opts.EnableSSRFProtection, "enable SSRF protection using InferencePool allowlisting")
+	fs.BoolVar(&opts.EnablePrefillerSampling, enablePrefillerSampling, opts.EnablePrefillerSampling, "if true, the target prefill instance will be selected randomly from among the provided prefill host values")
+	fs.StringVar(&opts.PoolGroup, poolGroup, opts.PoolGroup, "group of the InferencePool this Endpoint Picker is associated with.")
 
-	fs.StringSliceVar(&opts.enableTLS, "enable-tls", opts.enableTLS, "stages to enable TLS for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
-	fs.StringSliceVar(&opts.tlsInsecureSkipVerify, "tls-insecure-skip-verify", opts.tlsInsecureSkipVerify, "stages to skip TLS verification for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
-	fs.StringVar(&opts.inferencePool, "inference-pool", opts.inferencePool, "InferencePool in namespace/name or name format (e.g., default/my-pool or my-pool). A single name implies the 'default' namespace. Can also use INFERENCE_POOL env var.")
+	fs.StringSliceVar(&opts.enableTLS, enableTLS, opts.enableTLS, "stages to enable TLS for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
+	fs.StringSliceVar(&opts.tlsInsecureSkipVerify, tlsInsecureSkipVerify, opts.tlsInsecureSkipVerify, "stages to skip TLS verification for. Supported: "+supportedTLSStageNamesStr+". Can be specified multiple times or as comma-separated values.")
+	fs.StringVar(&opts.inferencePool, inferencePool, opts.inferencePool, "InferencePool in namespace/name or name format (e.g., default/my-pool or my-pool). A single name implies the 'default' namespace. Can also use INFERENCE_POOL env var.")
 
 	// Deprecated flags - kept for backward compatibility
-	fs.StringVar(&opts.connector, "connector", opts.connector, "Deprecated: use --kv-connector instead. The P/D connector being used. Supported: "+supportedKVConnectorNamesStr)
-	_ = fs.MarkDeprecated("connector", "use --kv-connector instead")
+	fs.StringVar(&opts.connector, connector, opts.connector, "Deprecated: use --kv-connector instead. The P/D connector being used. Supported: "+supportedKVConnectorNamesStr)
+	_ = fs.MarkDeprecated(connector, "use --kv-connector instead")
 
-	fs.BoolVar(&opts.prefillerUseTLS, "prefiller-use-tls", opts.prefillerUseTLS, "Deprecated: use --enable-tls=prefiller instead. Whether to use TLS when sending requests to prefillers.")
-	_ = fs.MarkDeprecated("prefiller-use-tls", "use --enable-tls=prefiller instead")
+	fs.BoolVar(&opts.prefillerUseTLS, prefillerUseTLS, opts.prefillerUseTLS, "Deprecated: use --enable-tls=prefiller instead. Whether to use TLS when sending requests to prefillers.")
+	_ = fs.MarkDeprecated(prefillerUseTLS, "use --enable-tls=prefiller instead")
 	fs.BoolVar(&opts.decoderUseTLS, "decoder-use-tls", opts.decoderUseTLS, "Deprecated: use --enable-tls=decoder instead. Whether to use TLS when sending requests to the decoder.")
-	_ = fs.MarkDeprecated("decoder-use-tls", "use --enable-tls=decoder instead")
-	fs.BoolVar(&opts.prefillerInsecureSkipVerify, "prefiller-tls-insecure-skip-verify", opts.prefillerInsecureSkipVerify, "Deprecated: use --tls-insecure-skip-verify=prefiller instead. Skip TLS verification for requests to prefiller.")
-	_ = fs.MarkDeprecated("prefiller-tls-insecure-skip-verify", "use --tls-insecure-skip-verify=prefiller instead")
-	fs.BoolVar(&opts.decoderInsecureSkipVerify, "decoder-tls-insecure-skip-verify", opts.decoderInsecureSkipVerify, "Deprecated: use --tls-insecure-skip-verify=decoder instead. Skip TLS verification for requests to decoder.")
-	_ = fs.MarkDeprecated("decoder-tls-insecure-skip-verify", "use --tls-insecure-skip-verify=decoder instead")
+	_ = fs.MarkDeprecated(decoderUseTLS, "use --enable-tls=decoder instead")
+	fs.BoolVar(&opts.prefillerInsecureSkipVerify, prefillerTLSInsecureSkipVerify, opts.prefillerInsecureSkipVerify, "Deprecated: use --tls-insecure-skip-verify=prefiller instead. Skip TLS verification for requests to prefiller.")
+	_ = fs.MarkDeprecated(prefillerTLSInsecureSkipVerify, "use --tls-insecure-skip-verify=prefiller instead")
+	fs.BoolVar(&opts.decoderInsecureSkipVerify, decoderTLSInsecureSkipVerify, opts.decoderInsecureSkipVerify, "Deprecated: use --tls-insecure-skip-verify=decoder instead. Skip TLS verification for requests to decoder.")
+	_ = fs.MarkDeprecated(decoderTLSInsecureSkipVerify, "use --tls-insecure-skip-verify=decoder instead")
 
-	fs.StringVar(&opts.InferencePoolNamespace, "inference-pool-namespace", opts.InferencePoolNamespace, "Deprecated: use --inference-pool instead. The Kubernetes namespace for the InferencePool (defaults to INFERENCE_POOL_NAMESPACE env var)")
-	_ = fs.MarkDeprecated("inference-pool-namespace", "use --inference-pool instead")
-	fs.StringVar(&opts.InferencePoolName, "inference-pool-name", opts.InferencePoolName, "Deprecated: use --inference-pool instead. The specific InferencePool name (defaults to INFERENCE_POOL_NAME env var)")
-	_ = fs.MarkDeprecated("inference-pool-name", "use --inference-pool instead")
-	fs.IntVar(&opts.MaxIdleConnsPerHost, "max-idle-conns-per-host", opts.MaxIdleConnsPerHost, "max idle keep-alive connections per host for reverse proxy transports; set to at least the expected concurrency")
+	fs.StringVar(&opts.InferencePoolNamespace, inferencePoolNamespace, opts.InferencePoolNamespace, "Deprecated: use --inference-pool instead. The Kubernetes namespace for the InferencePool (defaults to INFERENCE_POOL_NAMESPACE env var)")
+	_ = fs.MarkDeprecated(inferencePoolNamespace, "use --inference-pool instead")
+	fs.StringVar(&opts.InferencePoolName, inferencePoolName, opts.InferencePoolName, "Deprecated: use --inference-pool instead. The specific InferencePool name (defaults to INFERENCE_POOL_NAME env var)")
+	_ = fs.MarkDeprecated(inferencePoolName, "use --inference-pool instead")
+	fs.StringVar(&opts.configurationFromInlineSpecification, configuration, "", "Sidecar configuration in YAML provided as inline specification. Example `--configuration={port: 8085, vllm-port: 8203}`")
+	fs.StringVar(&opts.configurationFromFile, configurationFile, "", "Path to file which contains sidecar configuration in YAML. Example `--configuration-file=/etc/config/sidecar-config.yaml`")
 }
 
 // validateStages checks if all stages in the slice are valid according to the supportedStages map
@@ -175,10 +233,20 @@ func validateStages(stages []string, supportedStages map[string]struct{}, flagNa
 }
 
 // Complete performs post-processing of parsed command-line arguments.
-// It handles migration from deprecated flags, parses the InferencePool field,
+// It handles extraction of YAML configuration (if provided), migration from deprecated flags, parses the InferencePool field,
 // computes boolean TLS fields, and builds Config.DecoderURL.
 // After Complete(), opts.Config is fully populated.
 func (opts *Options) Complete() error {
+	// GetConfigurationState calculates whether configuration is from default values, flags or environment variables
+	opts.getDefaults()
+	opts.getEnvVars()
+	opts.getFlags()
+
+	// extractYAMLConfiguration extracts YAML configuration from inline specification or file (if provided)
+	if err := opts.extractYAMLConfiguration(); err != nil {
+		return err
+	}
+
 	// Migrate deprecated connector flag to KVConnector
 	if opts.connector != "" && opts.KVConnector == "" {
 		opts.KVConnector = opts.connector
@@ -321,4 +389,490 @@ func (opts *Options) NewLogger() logr.Logger {
 		zap.UseFlagOptions(&opts.loggingOptions),
 		zap.Encoder(zapcore.NewJSONEncoder(config)),
 	)
+}
+
+// getDefaults updates `ConfigurationState` with configuration keys which contain default values
+func (opts *Options) getDefaults() {
+	opts.ConfigurationState.Defaults = append(opts.ConfigurationState.Defaults,
+		port,
+		vllmPort,
+		dataParallelSize,
+		kvConnector,
+		ecConnector,
+		enableSSRFProtection,
+		enablePrefillerSampling,
+		enableTLS,
+		tlsInsecureSkipVerify,
+		secureServing,
+		certPath,
+		poolGroup,
+	)
+}
+
+// getEnvVars updates `ConfigurationState` with configuration keys which contain values provided through environment variables
+func (opts *Options) getEnvVars() {
+	envVarMap := map[string]string{
+		envInferencePool:           inferencePool,
+		envInferencePoolNamespace:  inferencePoolNamespace,
+		envInferencePoolName:       inferencePoolName,
+		envEnablePrefillerSampling: enablePrefillerSampling,
+	}
+	for key, value := range envVarMap {
+		if os.Getenv(key) != "" {
+			appendItem(&opts.ConfigurationState.FromEnv, value)
+		}
+	}
+}
+
+// getFlags updates `ConfigurationState` with configuration keys which contain values provided through flags
+func (opts *Options) getFlags() {
+	fromEnv := []struct {
+		envKey   string
+		envValue any
+	}{
+		{inferencePool, opts.inferencePool},
+		{inferencePoolNamespace, opts.InferencePoolNamespace},
+		{inferencePoolName, opts.InferencePoolName},
+		{enablePrefillerSampling, opts.EnablePrefillerSampling},
+	}
+	for _, check := range fromEnv {
+		if check.envValue != nil && opts.isFlagSet(check.envKey) {
+			appendItem(&opts.ConfigurationState.FromFlags, check.envKey)
+			removeItems(&opts.ConfigurationState.FromEnv, []string{check.envKey})
+		}
+	}
+	if len(opts.ConfigurationState.Defaults) != 0 {
+		for i := 0; i < len(opts.ConfigurationState.Defaults); i++ {
+			if opts.isFlagSet(opts.ConfigurationState.Defaults[i]) {
+				appendItem(&opts.ConfigurationState.FromFlags, opts.ConfigurationState.Defaults[i])
+				removeItems(&opts.ConfigurationState.Defaults, []string{opts.ConfigurationState.Defaults[i]})
+				i--
+			}
+		}
+	}
+}
+
+// extractYAMLConfiguration extracts sidecar configuration (if provided)
+// from `--configuration` and `--configuration-file` parameters
+func (opts *Options) extractYAMLConfiguration() error {
+	var fileCfg, inlineCfg configurationMap
+
+	if opts.configurationFromFile != "" {
+		var err error
+		fileCfg, err = opts.YAMLConfigurationFromFile()
+		if err != nil {
+			return err
+		}
+	}
+	if opts.configurationFromInlineSpecification != "" {
+		var err error
+		inlineCfg, err = opts.YAMLConfigurationFromInlineSpecification()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Merge: file is the base; inline overrides with higher priority.
+	merged := make(configurationMap)
+	for k, v := range fileCfg {
+		merged[k] = v
+		appendItem(&opts.ConfigurationState.FromFile, k)
+	}
+	for k, v := range inlineCfg {
+		merged[k] = v // inline wins
+		appendItem(&opts.ConfigurationState.FromInline, k)
+		removeItems(&opts.ConfigurationState.FromFile, []string{k})
+	}
+
+	if len(merged) == 0 {
+		return nil
+	}
+	if err := opts.updateSidecarConfiguration(merged); err != nil {
+		return err
+	}
+
+	// Higher-priority sources shadow lower ones in the state log.
+	removeDuplicates(&opts.ConfigurationState.FromFile, opts.ConfigurationState.FromFlags)
+	removeDuplicates(&opts.ConfigurationState.FromFile, opts.ConfigurationState.FromEnv)
+	removeDuplicates(&opts.ConfigurationState.FromInline, opts.ConfigurationState.FromFlags)
+	removeDuplicates(&opts.ConfigurationState.FromInline, opts.ConfigurationState.FromEnv)
+	removeDuplicates(&opts.ConfigurationState.Defaults, opts.ConfigurationState.FromInline)
+	removeDuplicates(&opts.ConfigurationState.Defaults, opts.ConfigurationState.FromFile)
+	return nil
+}
+
+// YAMLConfigurationFromInlineSpecification extracts YAML configuration provided as inline specification
+// "--configuration={port: 8085, vllm-port: 8203}"
+func (opts *Options) YAMLConfigurationFromInlineSpecification() (map[string]any, error) {
+	var temp map[string]any
+	if err := yaml.Unmarshal([]byte(opts.configurationFromInlineSpecification), &temp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal sidecar configuration from inline specification: %w", err)
+	}
+	return temp, nil
+}
+
+// YAMLConfigurationFromFile extracts YAML configuration from file path
+// "--configuration-file=/etc/config/sidecar-config.yaml"
+func (opts *Options) YAMLConfigurationFromFile() (map[string]any, error) {
+	var temp map[string]any
+	rawFile, err := os.ReadFile(opts.configurationFromFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sidecar configuration from file: %w", err)
+	}
+	if err := yaml.Unmarshal(rawFile, &temp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal sidecar configuration from file: %w", err)
+	}
+	return temp, nil
+}
+
+// flagConfiguration contains
+// 1. flag name
+// 2. function to update value when flag contains default value
+type flagConfiguration struct {
+	flag   string
+	update func(opts *Options, value any) error
+}
+
+var flagConfigurationList = []flagConfiguration{
+	{
+		flag: port,
+		update: func(opts *Options, value any) error {
+			v, err := extractInt(value)
+			if err != nil {
+				return err
+			}
+			opts.Port = strconv.Itoa(v)
+			return nil
+		},
+	},
+	{
+		flag: vllmPort,
+		update: func(opts *Options, value any) error {
+			v, err := extractInt(value)
+			if err != nil {
+				return err
+			}
+			opts.vllmPort = strconv.Itoa(v)
+			return nil
+		},
+	},
+	{
+		flag: dataParallelSize,
+		update: func(opts *Options, value any) error {
+			v, err := extractInt(value)
+			if err != nil {
+				return err
+			}
+			opts.DataParallelSize = v
+			return nil
+		},
+	},
+	{
+		flag: kvConnector,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.KVConnector = v
+			return nil
+		},
+	},
+	{
+		flag: ecConnector,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.ECConnector = v
+			return nil
+		},
+	},
+	{
+		flag: connector,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.connector = v
+			return nil
+		},
+	},
+	{
+		flag: enableSSRFProtection,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.EnableSSRFProtection = v
+			return nil
+		},
+	},
+	{
+		flag: enablePrefillerSampling,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.EnablePrefillerSampling = v
+			return nil
+		},
+	},
+	{
+		flag: enableTLS,
+		update: func(opts *Options, v any) error {
+			switch t := v.(type) {
+			case string:
+				opts.enableTLS = strings.Split(t, ",")
+			case []any:
+				temp := make([]string, 0, 10)
+				for _, val := range t {
+					temp = append(temp, fmt.Sprintf("%v", val))
+				}
+				opts.enableTLS = temp
+			default:
+				return fmt.Errorf("invalid type %T", v)
+			}
+			return nil
+		},
+	},
+	{
+		flag: prefillerUseTLS,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.prefillerUseTLS = v
+			return nil
+		},
+	},
+	{
+		flag: decoderUseTLS,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.decoderUseTLS = v
+			return nil
+		},
+	},
+	{
+		flag: tlsInsecureSkipVerify,
+		update: func(opts *Options, value any) error {
+			v, err := extractSliceString(value)
+			if err != nil {
+				return err
+			}
+			opts.tlsInsecureSkipVerify = v
+			return nil
+		},
+	},
+	{
+		flag: prefillerTLSInsecureSkipVerify,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.prefillerInsecureSkipVerify = v
+			return nil
+		},
+	},
+	{
+		flag: decoderTLSInsecureSkipVerify,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.decoderInsecureSkipVerify = v
+			return nil
+		},
+	},
+	{
+		flag: secureServing,
+		update: func(opts *Options, value any) error {
+			v, err := extractBool(value)
+			if err != nil {
+				return err
+			}
+			opts.SecureServing = v
+			return nil
+		},
+	},
+	{
+		flag: certPath,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.CertPath = v
+			return nil
+		},
+	},
+	{
+		flag: inferencePool,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.inferencePool = v
+			return nil
+		},
+	},
+	{
+		flag: poolGroup,
+		update: func(opts *Options, value any) error {
+			v, err := extractString(value)
+			if err != nil {
+				return err
+			}
+			opts.PoolGroup = v
+			return nil
+		},
+	},
+}
+
+// updateSidecarConfiguration updates value from YAML only when:
+// 1. YAML configuration contains value
+// 2. sidecar configuration contains default value
+// i.e. gives higher priority to configuration provided individually through flags (e.g. `--port`, `--vllm-port`) over configuration provided through YAML
+func (opts *Options) updateSidecarConfiguration(configurationMap configurationMap) error {
+	for _, flagConfiguration := range flagConfigurationList {
+		value, ok := configurationMap[flagConfiguration.flag]
+		if !ok {
+			continue
+		}
+		if flagConfiguration.flag == inferencePool {
+			if opts.inferencePool == "" {
+				if err := flagConfiguration.update(opts, value); err != nil {
+					return fmt.Errorf("update failed for: %v. %w", value, err)
+				}
+				removeItems(&opts.ConfigurationState.FromFlags, []string{inferencePool, inferencePoolNamespace, inferencePoolName})
+				removeItems(&opts.ConfigurationState.FromEnv, []string{inferencePool, inferencePoolNamespace, inferencePoolName})
+			}
+			continue
+		}
+		removeItems(&opts.ConfigurationState.Defaults, []string{flagConfiguration.flag})
+		if opts.isFlagSet(flagConfiguration.flag) {
+			appendItem(&opts.ConfigurationState.FromFlags, flagConfiguration.flag)
+			continue
+		}
+		if err := flagConfiguration.update(opts, value); err != nil {
+			return fmt.Errorf("update failed for: %v. %w", value, err)
+		}
+
+	}
+	return nil
+}
+
+// isFlagSet returns true if flag was set by user
+func (opts *Options) isFlagSet(parameter string) bool {
+	if opts.pflagSet != nil {
+		flag := opts.pflagSet.Lookup(parameter)
+		if flag != nil && flag.Changed {
+			return true
+		}
+	}
+	return false
+}
+
+// extractString extracts string from interface
+func extractString(value any) (string, error) {
+	v, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("type assertion failed for value: %v", value)
+	}
+	return v, nil
+}
+
+// extractSliceString returns slice of strings from interface
+func extractSliceString(value any) ([]string, error) {
+	switch v := value.(type) {
+	case []string:
+		return v, nil
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			str, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("type assertion failed for value: %v", value)
+			}
+			result = append(result, str)
+		}
+		return result, nil
+	case string:
+		if v == "" {
+			return nil, nil
+		}
+		return strings.Split(v, ","), nil
+	default:
+		return nil, fmt.Errorf("type assertion failed for value: %v", value)
+	}
+}
+
+// extractBool extracts bool from interface
+func extractBool(value any) (bool, error) {
+	v, ok := value.(bool)
+	if !ok {
+		return false, fmt.Errorf("type assertion failed for value: %v", value)
+	}
+	return v, nil
+}
+
+// extractInt extracts int from interface
+func extractInt(value any) (int, error) {
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case float64:
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("type assertion failed for value: %v", value)
+	}
+}
+
+// removeDuplicates removes duplicate value from lower priority slice
+func removeDuplicates(lowPriority *[]string, highPriority []string) {
+	temp := make(map[string]bool)
+	for _, item := range highPriority {
+		temp[item] = true
+	}
+	result := (*lowPriority)[:0]
+	for _, item := range *lowPriority {
+		if !temp[item] {
+			result = append(result, item)
+		}
+	}
+	*lowPriority = result
+}
+
+// removeItems removes list of items from a slice
+func removeItems(slice *[]string, items []string) {
+	temp := make(map[string]struct{})
+	for _, item := range items {
+		temp[item] = struct{}{}
+	}
+	result := (*slice)[:0]
+	for _, value := range *slice {
+		if _, ok := temp[value]; !ok {
+			result = append(result, value)
+		}
+	}
+	*slice = result
+}
+
+// appendItem appends an item to slice only if it is unique
+func appendItem(slice *[]string, item string) {
+	if !slices.Contains(*slice, item) {
+		*slice = append(*slice, item)
+	}
 }

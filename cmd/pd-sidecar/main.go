@@ -65,6 +65,14 @@ func main() {
 		return
 	}
 
+	logger.Info("Sidecar Configuration provenance",
+		"Configuration with default values", opts.ConfigurationState.Defaults,
+		"Configuration from environment variables", opts.ConfigurationState.FromEnv,
+		"Configuration from flags", opts.ConfigurationState.FromFlags,
+		"Configuration from inline-specification i.e. `--configuration` flag", opts.ConfigurationState.FromInline,
+		"Configuration from file i.e. `--configuration-file` flag", opts.ConfigurationState.FromFile,
+	)
+
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
 	logger.Info("Proxy configuration", "config", opts.Config)
 
